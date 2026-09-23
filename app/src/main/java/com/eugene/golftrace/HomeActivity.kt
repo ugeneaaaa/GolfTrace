@@ -9,7 +9,7 @@ import android.view.Gravity
 import android.widget.LinearLayout
 import android.widget.TextView
 
-/** 首页：三个入口，录制 / 回看 / 杆头分析。 */
+/** 首页：录制 / 回看 / 杆头分析 / 关于。 */
 class HomeActivity : Activity() {
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
@@ -41,6 +41,9 @@ class HomeActivity : Activity() {
         }
         card("◎ 杆头分析", "自动找挥杆 · 上杆杆头打点 · 节奏", 0xFF6FB6FF.toInt()) {
             startActivity(Intent(this, MainActivity::class.java))
+        }
+        card("ℹ 关于", "版本 · 能力说明 · 相册目录", 0xFFAAAAAA.toInt()) {
+            startActivity(Intent(this, AboutActivity::class.java))
         }
         root.gravity = Gravity.TOP
         val content = root
