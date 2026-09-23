@@ -36,7 +36,7 @@ class HomeActivity : Activity() {
         card("● 录制", "快门 / ISO / 镜头 / 水平仪 / DTL·正面预设", 0xFFFF5A5A.toInt()) {
             startActivity(Intent(this, CameraActivity::class.java))
         }
-        card("▶ 回看", "时间线拖动 · 逐帧 · 1/20 慢放 · 双指放大", C_YELLOW) {
+        card("▶ 回看", "逐帧 · fps 慢放 · 截图连截 · 双指放大", C_YELLOW) {
             startActivity(Intent(this, PlayerActivity::class.java))
         }
         card("◎ 杆头分析", "自动找挥杆 · 上杆杆头打点 · 节奏", 0xFF6FB6FF.toInt()) {
