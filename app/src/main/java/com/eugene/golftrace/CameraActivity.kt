@@ -99,7 +99,6 @@ class CameraActivity : Activity(), SensorEventListener {
     private var recorder: MediaRecorder? = null
     private var hsRec: HighSpeedRecorder? = null
     private var hsWriting = false
-    private var hsBlocked = false
     private var recUri: Uri? = null
     private var recPfd: ParcelFileDescriptor? = null
     private var recStart = 0L
@@ -140,7 +139,6 @@ class CameraActivity : Activity(), SensorEventListener {
         window.statusBarColor = Color.BLACK
         cm = getSystemService(CameraManager::class.java)
         sm = getSystemService(SensorManager::class.java)
-        hsBlocked = prefs.getBoolean("hs_blocked", false)
         lenses = findLenses()
         station = prefs.getString("station", "DTL") ?: "DTL"
         val content = buildUi()
@@ -215,12 +213,6 @@ class CameraActivity : Activity(), SensorEventListener {
         val topLeft = LinearLayout(this).apply { setPadding(dp(12), dp(10), dp(12), 0) }
         resBtn = pill("1080p") { pickRes() }
         fpsBtn = pill("60 FPS") { pickFps() }
-        // 长按：重新试一次高速档（系统更新后可能就支持了）
-        fpsBtn.setOnLongClickListener {
-            prefs.edit().putBoolean("hs_blocked", false).apply()
-            hsBlocked = false; rebuildModes(); refreshButtons()
-            toast("已重新打开高速档，选 120/240 试试"); true
-        }
         topLeft.addView(resBtn); topLeft.addView(View(this), LinearLayout.LayoutParams(dp(8), 1))
         topLeft.addView(fpsBtn)
         root.addView(topLeft, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START))
@@ -470,7 +462,7 @@ class CameraActivity : Activity(), SensorEventListener {
             val maxFps = if (minDur > 0) (1e9 / minDur).roundToInt() else 30
             for (f in intArrayOf(30, 60)) if (f <= maxFps + 1) out.add(Mode(sz, f, false))
             // 高速档（120 / 240）
-            if (!hsBlocked && hsSizes.contains(sz)) {
+            if (hsSizes.contains(sz)) {
                 val ranges = try { map.getHighSpeedVideoFpsRangesFor(sz).toList() } catch (_: Exception) { emptyList() }
                 ranges.map { it.upper }.distinct().filter { it >= 120 }.sorted().forEach {
                     if (out.none { m -> m.size == sz && m.fps == it }) out.add(Mode(sz, it, true))
@@ -554,11 +546,10 @@ class CameraActivity : Activity(), SensorEventListener {
         val hs = hsRec ?: return
         if (mode() !== m || hs.sawOutput) return
         android.util.Log.e("GT", "high speed produced no frames, disabling")
-        prefs.edit().putBoolean("hs_blocked", true).apply()
-        hsBlocked = true
         if (recording()) stopRecording()
-        rebuildModes()
-        toast("这台机器不给第三方 App 的编码器送高速帧，${m.fps}fps 用不了，已退回普通帧率")
+        val back = modes.indexOfLast { !it.highSpeed && it.size == m.size }
+        if (back >= 0) modeIdx = back
+        toast("${m.fps}fps 编码器本次没收到画面，已退回 ${mode()?.fps ?: 60}fps")
         reopen()
     }
 
@@ -571,19 +562,25 @@ class CameraActivity : Activity(), SensorEventListener {
 
     private fun reopen() { closeCamera(); refreshButtons(); if (texture.isAvailable) openCamera() }
 
-    /** 相机出的是横画幅，转 90° 填满竖着的取景框。 */
+    /** SurfaceTexture 已处理传感器方向；这里只补偿屏幕旋转并保持居中裁切。 */
     private fun applyPreviewTransform(sz: Size) {
         val w = texture.width.toFloat(); val h = texture.height.toFloat()
         if (w <= 0 || h <= 0) return
-        val rot = chars?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
         val cx = w / 2; val cy = h / 2
         val vr = android.graphics.RectF(0f, 0f, w, h)
-        val br = android.graphics.RectF(0f, 0f, sz.height.toFloat(), sz.width.toFloat())
-        br.offset(cx - br.centerX(), cy - br.centerY())
         val m = android.graphics.Matrix()
-        m.setRectToRect(vr, br, android.graphics.Matrix.ScaleToFit.FILL)
-        m.postScale(max(h / sz.height, w / sz.width), max(h / sz.height, w / sz.width), cx, cy)
-        m.postRotate(if (rot == 270) 270f else 90f, cx, cy)
+        when (texture.display?.rotation ?: Surface.ROTATION_0) {
+            Surface.ROTATION_90, Surface.ROTATION_270 -> {
+                val br = android.graphics.RectF(0f, 0f, sz.height.toFloat(), sz.width.toFloat())
+                br.offset(cx - br.centerX(), cy - br.centerY())
+                m.setRectToRect(vr, br, android.graphics.Matrix.ScaleToFit.FILL)
+                val scale = max(h / sz.height.toFloat(), w / sz.width.toFloat())
+                m.postScale(scale, scale, cx, cy)
+                val rotation = texture.display?.rotation ?: Surface.ROTATION_0
+                m.postRotate(90f * (rotation - 2), cx, cy)
+            }
+            Surface.ROTATION_180 -> m.postRotate(180f, cx, cy)
+        }
         texture.setTransform(m)
         // TextureView 每次布局会把缓冲尺寸改回视图大小，这里再钉回相机尺寸
         texture.surfaceTexture?.setDefaultBufferSize(sz.width, sz.height)
@@ -600,7 +597,10 @@ class CameraActivity : Activity(), SensorEventListener {
         ui.post { applyPreviewTransform(m.size) }
         previewSurface = Surface(st)
         if (m.highSpeed && hsRec == null) hsRec = try {
-            HighSpeedRecorder(m.size, m.fps, bitrate(), encoderOk(MediaFormat.MIMETYPE_VIDEO_HEVC, m))
+            // OnePlus 15 的 Camera2 高速会话能建立，但 HEVC Surface 不收帧；高速档优先 AVC。
+            val useHevc = !encoderOk(MediaFormat.MIMETYPE_VIDEO_AVC, m) &&
+                encoderOk(MediaFormat.MIMETYPE_VIDEO_HEVC, m)
+            HighSpeedRecorder(m.size, m.fps, bitrate(), useHevc)
         } catch (e: Exception) { android.util.Log.e("GT", "hs encoder", e); null }
         if (!m.highSpeed) { hsRec?.release(); hsRec = null }
         val targets = listOfNotNull(previewSurface, if (m.highSpeed) hsRec?.surface else recSurface)
@@ -610,7 +610,8 @@ class CameraActivity : Activity(), SensorEventListener {
                 android.util.Log.i("GT", "session ok hs=${m.highSpeed} targets=${targets.size} fps=${m.fps}")
                 session = s
                 applySettings(recSurface)
-                if (m.highSpeed) ui.postDelayed({ checkHighSpeedFeed(m) }, 2000)
+                // Qualcomm/OPlus 高速管线首次出帧可能较慢，避免 2 秒时误判并永久隐藏全部高速档。
+                if (m.highSpeed) ui.postDelayed({ checkHighSpeedFeed(m) }, 5000)
                 if (recSurface != null) ui.post {
                     try { recorder?.start(); recStart = SystemClock.elapsedRealtime(); tickRec() }
                     catch (e: Exception) {

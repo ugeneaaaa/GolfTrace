@@ -44,6 +44,7 @@ class HighSpeedRecorder(
             setInteger(MediaFormat.KEY_PRIORITY, 0)
         }
         codec = MediaCodec.createEncoderByType(mime)
+        Log.i("GT", "hs codec=${codec.name} mime=$mime size=${size.width}x${size.height} fps=$fps")
         codec.setCallback(object : MediaCodec.Callback() {
             override fun onInputBufferAvailable(c: MediaCodec, i: Int) {}
             override fun onOutputBufferAvailable(c: MediaCodec, i: Int, info: MediaCodec.BufferInfo) {
@@ -62,15 +63,20 @@ class HighSpeedRecorder(
         codec.start()
     }
 
-    private var seen = 0
+    @Volatile private var seen = 0
     /** 相机有没有真的往编码器送过帧。 */
     val sawOutput get() = seen > 0
 
     private fun drain(c: MediaCodec, i: Int, info: MediaCodec.BufferInfo) {
         synchronized(lock) {
-            if (seen++ % 60 == 0) Log.i("GT", "enc out #$seen size=${info.size} flags=${info.flags} writing=$writing track=$track")
             val cfg = info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
             val key = info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
+            if (!cfg && info.size > 0) {
+                seen++
+                if (seen == 1 || seen % 60 == 0) {
+                    Log.i("GT", "enc out #$seen size=${info.size} flags=${info.flags} pts=${info.presentationTimeUs}")
+                }
+            }
             // 不在录的时候，帧直接丢掉；录的时候从第一个关键帧开始写
             if (writing && !cfg && info.size > 0 && (track >= 0 || key)) {
                 if (track < 0) startTrack()
