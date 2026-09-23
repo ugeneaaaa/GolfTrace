@@ -1,0 +1,9 @@
+.gradle/
+.kotlin/
+build/
+local.properties
+*.apk
+*.mp4
+*.gray
+.DS_Store
+.idea/
