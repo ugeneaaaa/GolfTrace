@@ -97,12 +97,15 @@ class CameraActivity : Activity(), SensorEventListener {
     private var session: CameraCaptureSession? = null
     private var chars: CameraCharacteristics? = null
     private var recorder: MediaRecorder? = null
-    private var hsRec: HighSpeedRecorder? = null
+    // OnePlus 15 上 MediaCodec 输入 Surface 会收满 HAL 缓冲但不产出编码帧。
+    // 高速档改为在建会话前就 prepare MediaRecorder，并让它的 Surface 常驻高速会话。
+    private var hsRecorder: MediaRecorder? = null
     private var hsWriting = false
     private var recUri: Uri? = null
     private var recPfd: ParcelFileDescriptor? = null
     private var recStart = 0L
     private var lastUri: Uri? = null
+    private var cameraResumed = false
     private var metering = 0          // >0：测光中，剩余帧数
     private var manualOk = true
     private val bgThread = HandlerThread("cam").apply { start() }
@@ -154,6 +157,7 @@ class CameraActivity : Activity(), SensorEventListener {
 
     override fun onResume() {
         super.onResume()
+        cameraResumed = true
         (sm.getDefaultSensor(Sensor.TYPE_GRAVITY) ?: sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER))?.let {
             sm.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
         }
@@ -165,6 +169,7 @@ class CameraActivity : Activity(), SensorEventListener {
 
     override fun onPause() {
         super.onPause()
+        cameraResumed = false
         sm.unregisterListener(this)
         if (recording()) stopRecording()
         closeCamera()
@@ -384,6 +389,7 @@ class CameraActivity : Activity(), SensorEventListener {
 
     private fun bitrate(): Int {
         val m = mode() ?: return 10_000_000
+        if (m.highSpeed) highSpeedProfile(m)?.let { return it.videoBitRate }
         val px = m.size.width.toLong() * m.size.height
         // 约 0.10 bit/像素/帧，HEVC 下画质够用又省空间
         return (px * m.fps * 0.10).toLong().coerceIn(6_000_000L, 60_000_000L).toInt()
@@ -392,7 +398,7 @@ class CameraActivity : Activity(), SensorEventListener {
     private fun updateInfo() {
         val m = mode()
         val mbMin = bitrate() * 60f / 8f / 1e6f
-        val codec = if (hevcOk()) "HEVC" else "H.264"
+        val codec = if (m?.highSpeed == true) "H.264" else if (hevcOk()) "HEVC" else "H.264"
         val manual = if (!manualOk) "  ⚠ 此镜头不支持手动曝光"
             else if (m?.highSpeed == true) "  ⚠ 高速档由相机自动曝光" else ""
         val sz = m?.let { "${it.size.height}×${it.size.width} " } ?: ""
@@ -412,7 +418,7 @@ class CameraActivity : Activity(), SensorEventListener {
 
     /** 用等效焦距算出相对主摄的倍率：0.6x 超广角 / 1x 主摄 / 5x 长焦。 */
     private fun findLenses(): List<Lens> {
-        class Phys(val id: String, val eq35: Float, val zr: Range<Float>?)
+        class Phys(val id: String, val eq35: Float, val zr: Range<Float>?, val logical: Boolean)
         val phys = ArrayList<Phys>()
         for (id in cm.cameraIdList) {
             val c = try { cm.getCameraCharacteristics(id) } catch (_: Exception) { continue }
@@ -423,13 +429,17 @@ class CameraActivity : Activity(), SensorEventListener {
             val diag = sqrt((s.width * s.width + s.height * s.height).toDouble()).toFloat()
             val eq = if (diag > 0) f * 43.27f / diag else f
             val zr = if (Build.VERSION.SDK_INT >= 30) c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) else null
-            phys.add(Phys(id, eq, zr))
+            val caps = c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
+            val logical = CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA in caps
+            phys.add(Phys(id, eq, zr, logical))
         }
         if (phys.isEmpty()) return emptyList()
         // 主摄：等效焦距最接近 24mm 的那颗
-        val main = phys.minByOrNull { abs(it.eq35 - 24f) }!!
+        // PLK110 同时暴露逻辑主摄 0 和物理主摄 2；高速 CamcorderProfile 只绑定在物理 2。
+        val main = phys.minWithOrNull(compareBy<Phys>({ abs(it.eq35 - 24f) }, { if (it.logical) 1 else 0 }))!!
         val out = ArrayList<Lens>()
-        for (p in phys) {
+        // 同画角去重时优先保留物理 ID，避免逻辑相机与厂商媒体 profile 对不上。
+        for (p in phys.sortedBy { if (it.logical) 1 else 0 }) {
             val x = p.eq35 / main.eq35
             val kind = when {
                 x < 0.8f -> "超广角"
@@ -461,11 +471,12 @@ class CameraActivity : Activity(), SensorEventListener {
             val minDur = map.getOutputMinFrameDuration(MediaRecorder::class.java, sz)
             val maxFps = if (minDur > 0) (1e9 / minDur).roundToInt() else 30
             for (f in intArrayOf(30, 60)) if (f <= maxFps + 1) out.add(Mode(sz, f, false))
-            // 高速档（120 / 240）
+            // 高速档：这台机器的 240fps（1080p/720p）实测始终是假的（HAL 接受请求，传感器不切高速模式），
+            // 已确认只有 120fps 是真实可用的，所以只提供 120，不再展示 240。
             if (hsSizes.contains(sz)) {
                 val ranges = try { map.getHighSpeedVideoFpsRangesFor(sz).toList() } catch (_: Exception) { emptyList() }
-                ranges.map { it.upper }.distinct().filter { it >= 120 }.sorted().forEach {
-                    if (out.none { m -> m.size == sz && m.fps == it }) out.add(Mode(sz, it, true))
+                if (ranges.any { it.upper >= 120 } && out.none { m -> m.size == sz && m.fps == 120 }) {
+                    out.add(Mode(sz, 120, true))
                 }
             }
         }
@@ -541,26 +552,18 @@ class CameraActivity : Activity(), SensorEventListener {
         } catch (e: Exception) { toast("打开相机失败：${e.message}") }
     }
 
-    /** 有些机器（如本机）会接受高速会话，却只喂预览、不给编码器送帧，录出来是空文件。 */
-    private fun checkHighSpeedFeed(m: Mode) {
-        val hs = hsRec ?: return
-        if (mode() !== m || hs.sawOutput) return
-        android.util.Log.e("GT", "high speed produced no frames, disabling")
-        if (recording()) stopRecording()
-        val back = modes.indexOfLast { !it.highSpeed && it.size == m.size }
-        if (back >= 0) modeIdx = back
-        toast("${m.fps}fps 编码器本次没收到画面，已退回 ${mode()?.fps ?: 60}fps")
-        reopen()
-    }
 
     private fun closeCamera() {
-        hsRec?.release(); hsRec = null; hsWriting = false
         try { session?.close() } catch (_: Exception) {}
         session = null
         device?.close(); device = null
+        try { hsRecorder?.release() } catch (_: Exception) {}
+        hsRecorder = null; hsWriting = false
+        // 高速档打开时会预先创建 pending 文件；未按录制就离开时不能留下空文件。
+        if (recUri != null && recorder == null) discardPendingRecording()
     }
 
-    private fun reopen() { closeCamera(); refreshButtons(); if (texture.isAvailable) openCamera() }
+    private fun reopen() { closeCamera(); refreshButtons(); if (cameraResumed && texture.isAvailable) openCamera() }
 
     /** SurfaceTexture 已处理传感器方向；这里只补偿屏幕旋转并保持居中裁切。 */
     private fun applyPreviewTransform(sz: Size) {
@@ -596,22 +599,18 @@ class CameraActivity : Activity(), SensorEventListener {
         st.setDefaultBufferSize(m.size.width, m.size.height)
         ui.post { applyPreviewTransform(m.size) }
         previewSurface = Surface(st)
-        if (m.highSpeed && hsRec == null) hsRec = try {
-            // OnePlus 15 的 Camera2 高速会话能建立，但 HEVC Surface 不收帧；高速档优先 AVC。
-            val useHevc = !encoderOk(MediaFormat.MIMETYPE_VIDEO_AVC, m) &&
-                encoderOk(MediaFormat.MIMETYPE_VIDEO_HEVC, m)
-            HighSpeedRecorder(m.size, m.fps, bitrate(), useHevc)
-        } catch (e: Exception) { android.util.Log.e("GT", "hs encoder", e); null }
-        if (!m.highSpeed) { hsRec?.release(); hsRec = null }
-        val targets = listOfNotNull(previewSurface, if (m.highSpeed) hsRec?.surface else recSurface)
+        if (m.highSpeed && hsRecorder == null && !prepareHighSpeedRecorder(m)) return
+        if (!m.highSpeed) {
+            try { hsRecorder?.release() } catch (_: Exception) {}
+            hsRecorder = null
+        }
+        val targets = listOfNotNull(previewSurface, if (m.highSpeed) hsRecorder?.surface else recSurface)
         try { session?.close() } catch (_: Exception) {}
         val cb = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(s: CameraCaptureSession) {
                 android.util.Log.i("GT", "session ok hs=${m.highSpeed} targets=${targets.size} fps=${m.fps}")
                 session = s
                 applySettings(recSurface)
-                // Qualcomm/OPlus 高速管线首次出帧可能较慢，避免 2 秒时误判并永久隐藏全部高速档。
-                if (m.highSpeed) ui.postDelayed({ checkHighSpeedFeed(m) }, 5000)
                 if (recSurface != null) ui.post {
                     try { recorder?.start(); recStart = SystemClock.elapsedRealtime(); tickRec() }
                     catch (e: Exception) {
@@ -638,8 +637,18 @@ class CameraActivity : Activity(), SensorEventListener {
                 val cfgs = targets.map { android.hardware.camera2.params.OutputConfiguration(it) }
                 val type = if (m.highSpeed) android.hardware.camera2.params.SessionConfiguration.SESSION_HIGH_SPEED
                     else android.hardware.camera2.params.SessionConfiguration.SESSION_REGULAR
-                d.createCaptureSession(android.hardware.camera2.params.SessionConfiguration(
-                    type, cfgs, { r -> bg.post(r) }, cb))
+                val config = android.hardware.camera2.params.SessionConfiguration(
+                    type, cfgs, { r -> bg.post(r) }, cb)
+                if (m.highSpeed) {
+                    // FPS 是 session 参数，创建会话时就要带上，否则后续 repeating request 里
+                    // 再设也不会重新配置 sensor/HAL。
+                    val params = d.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                    params.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(m.fps, m.fps))
+                    params.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                        CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+                    config.setSessionParameters(params.build())
+                }
+                d.createCaptureSession(config)
             } else {
                 @Suppress("DEPRECATION")
                 if (m.highSpeed) d.createConstrainedHighSpeedCaptureSession(targets, cb, bg)
@@ -658,7 +667,9 @@ class CameraActivity : Activity(), SensorEventListener {
         val b = d.createCaptureRequest(
             if (recSurface != null || m.highSpeed) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW)
         previewSurface?.let { b.addTarget(it) }
-        if (m.highSpeed) hsRec?.surface?.let { b.addTarget(it) } else recSurface?.let { b.addTarget(it) }
+        // 高速 Surface 虽然从建会话起就存在，但只有 MediaRecorder.start() 成功后才向它送帧。
+        if (m.highSpeed && hsWriting) hsRecorder?.surface?.let { b.addTarget(it) }
+        else if (!m.highSpeed) recSurface?.let { b.addTarget(it) }
         b.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
         b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
         b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
@@ -687,7 +698,7 @@ class CameraActivity : Activity(), SensorEventListener {
         try {
             if (m.highSpeed && s is CameraConstrainedHighSpeedCaptureSession) {
                 val list = s.createHighSpeedRequestList(b.build())
-                android.util.Log.i("GT", "hs burst size=${list.size} enc=${hsRec != null}")
+                android.util.Log.i("GT", "hs burst size=${list.size} recorder=${hsRecorder != null}")
                 s.setRepeatingBurst(list, cb, bg)
             } else s.setRepeatingRequest(b.build(), cb, bg)
         } catch (e: Exception) { ui.post { toast("设置失败：${e.message}") } }
@@ -723,19 +734,21 @@ class CameraActivity : Activity(), SensorEventListener {
 
     // ======================= 录制 =======================
 
-    /** 厂商给的高速录制档（120/240），拿不到就返回 null。 */
-    private fun highSpeedProfile(m: Mode): android.media.CamcorderProfile? {
-        val id = lens()?.id?.toIntOrNull() ?: return null
+    private fun getHighSpeedProfile(cameraId: String, size: Size): android.media.CamcorderProfile? {
+        val id = cameraId.toIntOrNull() ?: return null
         val q = when {
-            m.size.width >= 3000 && m.fps >= 240 -> android.media.CamcorderProfile.QUALITY_HIGH_SPEED_2160P
-            m.size.width >= 3000 -> android.media.CamcorderProfile.QUALITY_HIGH_SPEED_2160P
-            m.fps >= 240 -> android.media.CamcorderProfile.QUALITY_HIGH_SPEED_1080P
-            else -> android.media.CamcorderProfile.QUALITY_HIGH_SPEED_1080P
+            size.width >= 3000 -> android.media.CamcorderProfile.QUALITY_HIGH_SPEED_2160P
+            size.width >= 1900 -> android.media.CamcorderProfile.QUALITY_HIGH_SPEED_1080P
+            size.width >= 1200 -> android.media.CamcorderProfile.QUALITY_HIGH_SPEED_720P
+            else -> android.media.CamcorderProfile.QUALITY_HIGH_SPEED_480P
         }
         return try {
             if (android.media.CamcorderProfile.hasProfile(id, q)) android.media.CamcorderProfile.get(id, q) else null
         } catch (_: Exception) { null }
     }
+
+    /** 厂商给的高速录制档，拿不到就返回 null（这台机器只有 1080p 有；4K 高速档没有厂商 profile，走通用兜底参数）。 */
+    private fun highSpeedProfile(m: Mode) = lens()?.let { getHighSpeedProfile(it.id, m.size) }
 
     private fun hevcOk() = encoderOk(MediaFormat.MIMETYPE_VIDEO_HEVC, mode())
 
@@ -750,9 +763,7 @@ class CameraActivity : Activity(), SensorEventListener {
         }
     }
 
-    private fun startRecording() {
-        if (device == null) return
-        val m = mode() ?: return
+    private fun createPendingVideo(): Pair<Uri, ParcelFileDescriptor> {
         val name = "swing_${station}_${System.currentTimeMillis()}.mp4"
         val cv = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, name)
@@ -760,17 +771,94 @@ class CameraActivity : Activity(), SensorEventListener {
             put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/杆头轨迹")
             put(MediaStore.Video.Media.IS_PENDING, 1)
         }
+        val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, cv)
+            ?: throw IllegalStateException("不能创建视频文件")
+        return try {
+            uri to (contentResolver.openFileDescriptor(uri, "w")
+                ?: throw IllegalStateException("不能打开视频文件"))
+        } catch (e: Exception) {
+            try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
+            throw e
+        }
+    }
+
+    private fun discardPendingRecording() {
+        val uri = recUri
+        recUri = null
+        try { recPfd?.close() } catch (_: Exception) {}
+        recPfd = null
+        if (uri != null) try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
+    }
+
+    /**
+     * 高速会话创建前先把 MediaRecorder 准备好。OnePlus 15 不能在高速预览运行后
+     * 再换成第二个 Surface；Surface 必须从第一帧起就在同一个高速会话中。
+     */
+    private fun prepareHighSpeedRecorder(m: Mode): Boolean {
+        var r: MediaRecorder? = null
+        var uri: Uri? = null
+        var pfd: ParcelFileDescriptor? = null
+        return try {
+            val target = createPendingVideo()
+            uri = target.first; pfd = target.second
+            r = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this)
+                else @Suppress("DEPRECATION") MediaRecorder()
+            r.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            r.setOutputFile(pfd.fileDescriptor)
+            val profile = highSpeedProfile(m)
+            if (profile != null) {
+                android.util.Log.i("GT", "hs profile codec=${profile.videoCodec} " +
+                    "${profile.videoFrameWidth}x${profile.videoFrameHeight}@${profile.videoFrameRate} " +
+                    "bitrate=${profile.videoBitRate}")
+                // OPlus 的高速管线依赖厂商 CamcorderProfile 中的编码器配置。
+                r.setVideoEncoder(profile.videoCodec)
+                r.setVideoEncodingBitRate(profile.videoBitRate)
+                // 交给 OPlus 的高速 profile 原样配置。额外 setCaptureRate/profileLevel 会让
+                // 720p240 落回 30fps，尽管相机会话仍显示 240fps。
+                r.setVideoFrameRate(profile.videoFrameRate)
+                r.setVideoSize(profile.videoFrameWidth, profile.videoFrameHeight)
+            } else {
+                r.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+                // PLK110 的 media_profiles 把高速 profile 错挂在其他 cameraId；按其标准值兜底。
+                r.setVideoEncodingBitRate(50_000_000)
+                r.setVideoFrameRate(m.fps)
+                r.setVideoSize(m.size.width, m.size.height)
+                // 只有没有厂商高速 profile 时才使用通用 H.264 兜底参数。
+                r.setCaptureRate(m.fps.toDouble())
+            }
+            r.setOrientationHint(chars?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90)
+            r.prepare()
+            recUri = uri; recPfd = pfd; hsRecorder = r
+            android.util.Log.i("GT", "hs MediaRecorder armed ${m.size.width}x${m.size.height}@${m.fps}")
+            true
+        } catch (e: Exception) {
+            android.util.Log.e("GT", "arm hs MediaRecorder failed", e)
+            try { r?.release() } catch (_: Exception) {}
+            try { pfd?.close() } catch (_: Exception) {}
+            if (uri != null) try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
+            recUri = null; recPfd = null; hsRecorder = null
+            ui.post { toast("高速录制器准备失败：${e.message}") }
+            false
+        }
+    }
+
+    private fun startRecording() {
+        if (device == null) return
+        val m = mode() ?: return
         val orient = chars?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
         try {
-            val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, cv)!!
-            val pfd = contentResolver.openFileDescriptor(uri, "w")!!
-            recUri = uri; recPfd = pfd
             if (m.highSpeed) {
-                // 高速档：会话里本来就挂着编码器的面，这里只是开始写文件
-                val hs = hsRec ?: throw IllegalStateException("高速编码器没准备好")
-                hs.start(pfd, orient)
+                // Surface 已在会话配置中，但待机请求没有向它送帧；先启动消费者，再切双目标请求。
+                val hs = hsRecorder ?: throw IllegalStateException("高速录制器没准备好")
+                hs.start()
                 hsWriting = true
+                applySettings()
+                recStart = SystemClock.elapsedRealtime(); tickRec()
+                android.util.Log.i("GT", "hs MediaRecorder started ${m.fps}fps")
             } else {
+                val target = createPendingVideo()
+                recUri = target.first; recPfd = target.second
                 val r = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else @Suppress("DEPRECATION") MediaRecorder()
                 // 收音：击球声用来自动找挥杆（本 App 录的音画同步）
                 val audio = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
@@ -778,7 +866,7 @@ class CameraActivity : Activity(), SensorEventListener {
                 r.setVideoSource(MediaRecorder.VideoSource.SURFACE)
                 r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
                 if (audio) { r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC); r.setAudioEncodingBitRate(96_000); r.setAudioSamplingRate(48_000) }
-                r.setOutputFile(pfd.fileDescriptor)
+                r.setOutputFile(target.second.fileDescriptor)
                 r.setVideoEncoder(if (encoderOk(MediaFormat.MIMETYPE_VIDEO_HEVC, m))
                     MediaRecorder.VideoEncoder.HEVC else MediaRecorder.VideoEncoder.H264)
                 r.setVideoEncodingBitRate(bitrate())
@@ -796,35 +884,44 @@ class CameraActivity : Activity(), SensorEventListener {
             android.util.Log.e("GT", "startRecording failed", e)
             toast("录制失败：${e.message}")
             recorder?.release(); recorder = null
-            hsWriting = false; recPfd?.close(); recPfd = null; recUri = null
+            hsWriting = false
+            if (m.highSpeed) reopen() else discardPendingRecording()
         }
     }
 
     private fun stopRecording() {
         val r = recorder
         if (r == null && !hsWriting) return
-        var frames = -1
+        var saved = true
         if (r != null) {
             try { session?.stopRepeating() } catch (_: Exception) {}
-            try { r.stop() } catch (_: Exception) { toast("录制太短或失败") }
+            try { r.stop() } catch (_: Exception) { saved = false; toast("录制太短或失败") }
             r.release()
             recorder = null; activeRecSurface = null
         }
-        if (hsWriting) { frames = hsRec?.stop() ?: 0; hsWriting = false }
-        if (frames == 0) {   // 没录到东西：把占位文件删掉
-            recUri?.let { try { contentResolver.delete(it, null, null) } catch (_: Exception) {} }
-            recPfd?.close(); recPfd = null; recUri = null
+        if (hsWriting) {
+            // 先停止向编码 Surface 投递，再结束封装，避免留下未消费缓冲。
+            hsWriting = false
+            try { applySettings() } catch (_: Exception) {}
+            try { hsRecorder?.stop() } catch (e: Exception) {
+                saved = false
+                android.util.Log.e("GT", "hs MediaRecorder.stop failed", e)
+            }
+        }
+        if (!saved) {
+            discardPendingRecording()
             toast("这一段没录到画面")
-            refreshButtons(); return
+        } else {
+            recPfd?.close(); recPfd = null
+            recUri?.let {
+                contentResolver.update(it, ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }, null, null)
+                lastUri = it
+                toast("已存到 Movies/杆头轨迹")
+            }
+            recUri = null
         }
-        recPfd?.close(); recPfd = null
-        recUri?.let {
-            contentResolver.update(it, ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }, null, null)
-            lastUri = it
-            toast(if (frames >= 0) "已存 $frames 帧到 Movies/杆头轨迹" else "已存到 Movies/杆头轨迹")
-        }
-        recUri = null
-        if (r != null) startSession(null)   // 高速档会话保持不变
+        // MediaRecorder stop 后 Surface 不能复用；完整重开相机，为下一段预先准备新 Surface。
+        if (r != null) startSession(null) else reopen()
         refreshButtons()
     }
 
