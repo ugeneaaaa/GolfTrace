@@ -16,6 +16,11 @@ android {
     }
 
     buildTypes {
+        debug {
+            // 与已安装的正式版共存，避免不同电脑的 debug 签名无法覆盖安装。
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
         release {
             isMinifyEnabled = false
             signingConfig = signingConfigs.getByName("debug")

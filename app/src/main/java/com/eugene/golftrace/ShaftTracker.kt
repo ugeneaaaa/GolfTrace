@@ -145,15 +145,17 @@ object ShaftTracker {
         val out = ArrayList<Cand>()
         for (s in ss) {
             val ra = hypot(s.ax - cx, s.ay - cy); val rb = hypot(s.bx - cx, s.by - cy)
-            for (z in 0..1) {
-                val ex = if (z == 0) s.bx else s.ax; val ey = if (z == 0) s.by else s.ay
-                val nx = if (z == 0) s.ax else s.bx; val ny = if (z == 0) s.ay else s.by
-                val re = if (z == 0) rb else ra; val ro = if (z == 0) ra else rb
-                if (re < 0.35f * r0 || re > 1.9f * r0) continue
-                val cost = -s.cov * 0.6f + abs(re / r0 - 1f) * 0.3f + (if (re < ro) 0.6f else 0f)
-                // 有把握 = 线段够长（看得到整根杆到末端）；下杆糊掉时只到手/半截，远端不是杆头
-                out.add(Cand(ex, ey, cost, nx, ny, s.cov >= 0.75f))
-            }
+            // 杆头只能是离胸口更远的一端；另一端必须落在手/身体附近。
+            // 旧实现把两个端点都收入候选，背景树枝和草地边缘很容易形成一条“远处线段”，
+            // Viterbi 随后会在错误端点保持数百帧。
+            val aIsHead = ra >= rb
+            val ex = if (aIsHead) s.ax else s.bx; val ey = if (aIsHead) s.ay else s.by
+            val nx = if (aIsHead) s.bx else s.ax; val ny = if (aIsHead) s.by else s.ay
+            val re = max(ra, rb); val ro = min(ra, rb)
+            if (re < 0.50f * r0 || re > 1.9f * r0 || ro > 0.90f * r0) continue
+            val cost = -s.cov * 0.75f + abs(re / r0 - 1f) * 0.35f + ro / r0 * 0.15f
+            // 有把握 = 线段够长（看得到整根杆到末端）；下杆糊掉时只到手/半截，远端不是杆头
+            out.add(Cand(ex, ey, cost, nx, ny, s.cov >= 0.75f))
         }
         out.sortBy { it.cost }
         val ded = ArrayList<Cand>()
@@ -202,7 +204,11 @@ object ShaftTracker {
                 val j = nNew + q
                 // “保持”= 杆头没动：拿当前帧和这个位置最初被确认的那一帧比，杆头离开后差异会一直在
                 val lm = regionDiff(clip.frames[po[q]], fCur, w, h, px_[q].roundToInt(), py_[q].roundToInt(), hr)
-                nx[j] = px_[q]; ny[j] = py_[q]; nc[j] = pc[q] - 0.45f + min(0.8f, lm / 15f); nb[j] = q; no[j] = po[q]; nhx[j] = phx[q]; nhy[j] = phy[q]; nsu[j] = psu[q]
+                // 只有局部外观仍像最初确认帧时才奖励“保持”。杆头离开后，原位置已经变成草地，
+                // 差异必须快速淘汰保持路径；旧上限只有 +0.35/帧，压不过背景线段候选。
+                val holdCost = -0.08f + min(2.5f, max(0f, lm - 3f) / 4f)
+                nx[j] = px_[q]; ny[j] = py_[q]; nc[j] = pc[q] + holdCost; nb[j] = q; no[j] = po[q]
+                nhx[j] = phx[q]; nhy[j] = phy[q]; nsu[j] = psu[q] && lm < 4f
             }
             if (nx.size > 50) {
                 val idx = nc.indices.sortedBy { nc[it] }.take(50)

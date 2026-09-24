@@ -34,7 +34,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 ## 离线回放（单元测试）
 
 ```bash
-GT_RAW=帧.gray GT_W GT_H GT_SEED="帧,x,y" GT_GRIP="帧,x,y" GT_OUT=out.csv \
+GT_RAW=帧.gray GT_W GT_H GT_FPS=60 GT_SEED="帧,x,y" GT_GRIP="帧,x,y" GT_OUT=out.csv \
   ./gradlew testDebugUnitTest --tests '*TrackReplay*'
 ```
 
@@ -42,9 +42,10 @@ GT_RAW=帧.gray GT_W GT_H GT_SEED="帧,x,y" GT_GRIP="帧,x,y" GT_OUT=out.csv \
 
 ## 已知限制
 
-（分析侧，2026-09-19 用 9/18 素材实测；录制侧以真机能力为准）
+（分析侧，2026-09-24 用正面机位慢动作素材复测；录制侧以真机能力为准）
 
-- 正面机位 60fps：上杆、顶点准；下杆中段 2–3 帧杆身糊成一片，位置是近似；只跟到击球后 ~0.05s（之后腿的轮廓会干扰）
+- 正面慢动作素材：上杆、顶点和可辨认的下杆杆头会绘制；模糊或被遮挡的帧按低置信度留空，不再整段隐藏下杆
+- 只跟到击球后约 0.05s，之后腿部轮廓容易被误认成杆身
 - 背面机位（第一段）杆头在顶点出画面，没法跟
 - 旧 BMD 文件音画不同步（击球声晚 ~1s），击球声只作候选；本 App 录的是同步的
 - 部分机型高速档只有真实可用的帧率（例如 OnePlus PLK110 实测 120fps 可用，假 240 已隐藏）

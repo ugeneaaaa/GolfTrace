@@ -59,14 +59,34 @@ object Overlay {
                 p.color = colorOf(i, ph); c.drawCircle(pts[0], pts[1], r * 0.8f, p)
             }
         }
-        // 杆头轨迹：每帧一个实心点，上杆一种颜色、下杆一种颜色；点距 = 速度。只画有把握的帧
+        // 杆头轨迹：先连接相邻可信点，再叠加实心采样点。低置信区间超过 0.10s 时断开，
+        // 不把跟丢的一段硬拉成直线；短暂漏检则保持轨迹连续。
+        p.style = Paint.Style.STROKE
+        p.strokeCap = Paint.Cap.ROUND
+        var previous = -1
+        for (i in 0..min(upTo, clip.n - 1)) {
+            if (!head.has(i) || !head.sure[i]) continue
+            if (ph != null && ph.impact > 0 && i > ph.impact) break
+            if (previous >= 0 && clip.tUs[i] - clip.tUs[previous] <= 100_000L) {
+                pts[0] = head.x[previous]; pts[1] = head.y[previous]
+                pts[2] = head.x[i]; pts[3] = head.y[i]
+                m.mapPoints(pts)
+                p.color = 0x99000000.toInt(); p.strokeWidth = 4f * unit
+                c.drawLine(pts[0], pts[1], pts[2], pts[3], p)
+                p.color = colorOf(i, ph); p.strokeWidth = 2.2f * unit
+                c.drawLine(pts[0], pts[1], pts[2], pts[3], p)
+            }
+            previous = i
+        }
+
+        // 每帧一个实心点，上杆一种颜色、下杆一种颜色；点距 = 速度。只画有把握的帧
         p.style = Paint.Style.FILL
         for (i in 0..min(upTo, clip.n - 1)) {
             if (!head.has(i)) continue
             if (ph != null && ph.impact > 0 && i > ph.impact) continue   // 击球后不可靠，不画
             if (!head.sure[i]) continue                                // 杆头糊掉认不出，不猜
-            // 下杆（分界到击球之间）60fps 下杆头糊成拖影，实测认成手/身体轮廓：没有反光贴纸前不画
-            if (ph != null && ph.impact > 0 && i > ph.top && i < ph.impact && i !in head.anchors) continue
+            // 下杆不再整段隐藏：高帧率/慢动作素材已经能可靠识别杆身，是否绘制只由 sure 决定。
+            // 低帧率素材中的拖影候选会被 ShaftTracker 标成不确定，不在这里用阶段一刀切。
             if (i > 0 && head.has(i - 1) && head.x[i] == head.x[i - 1] && head.y[i] == head.y[i - 1] && i != cur) continue
             pts[0] = head.x[i]; pts[1] = head.y[i]; m.mapPoints(pts, 0, pts, 0, 1)
             p.color = 0xAA000000.toInt(); c.drawCircle(pts[0], pts[1], r + unit, p)
