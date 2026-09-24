@@ -53,6 +53,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.max
@@ -95,6 +96,7 @@ class CameraActivity : Activity(), SensorEventListener {
     private lateinit var cm: CameraManager
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
+    private val sessionGeneration = AtomicLong()
     private var chars: CameraCharacteristics? = null
     private var recorder: MediaRecorder? = null
     // OnePlus 15 上 MediaCodec 输入 Surface 会收满 HAL 缓冲但不产出编码帧。
@@ -108,6 +110,10 @@ class CameraActivity : Activity(), SensorEventListener {
     private var cameraResumed = false
     private var metering = 0          // >0：测光中，剩余帧数
     private var manualOk = true
+    private var hsShutterPriority = false
+    @Volatile private var actualExposureNs = 0L
+    @Volatile private var actualIso = 0
+    private var lastExposureUiMs = 0L
     private val bgThread = HandlerThread("cam").apply { start() }
     private val bg = Handler(bgThread.looper)
     private val ui = Handler(Looper.getMainLooper())
@@ -122,6 +128,7 @@ class CameraActivity : Activity(), SensorEventListener {
     private lateinit var zoomRow: LinearLayout
     private lateinit var shutterText: TextView
     private lateinit var isoText: TextView
+    private lateinit var meterBtn: TextView
     private lateinit var stationBtn: TextView
     private lateinit var resBtn: TextView
     private lateinit var fpsBtn: TextView
@@ -248,7 +255,7 @@ class CameraActivity : Activity(), SensorEventListener {
         bottom.addView(zoomRow)
 
         info = TextView(this).apply {
-            setTextColor(0xFF8E8E93.toInt()); textSize = 11f; setLines(2)
+            setTextColor(0xFF8E8E93.toInt()); textSize = 11f; setLines(3)
             gravity = Gravity.CENTER; setPadding(dp(10), 0, dp(10), dp(6))
         }
 
@@ -256,7 +263,7 @@ class CameraActivity : Activity(), SensorEventListener {
         val expo = LinearLayout(this).apply { gravity = Gravity.CENTER; setPadding(0, 0, 0, dp(8)) }
         shutterText = pill("1/1000", "快门") { pickShutter() }
         isoText = pill("800", "ISO") { pickIso() }
-        val meterBtn = pill("测光") { meter() }
+        meterBtn = pill("测光") { meter() }
         expo.addView(shutterText); expo.addView(View(this), LinearLayout.LayoutParams(dp(10), 1))
         expo.addView(isoText); expo.addView(View(this), LinearLayout.LayoutParams(dp(10), 1))
         expo.addView(meterBtn)
@@ -344,31 +351,57 @@ class CameraActivity : Activity(), SensorEventListener {
         if (recording()) return
         val sz = mode()?.size ?: return
         val list = modes.filter { it.size == sz }
-        menu(fpsBtn, list.map { if (it.highSpeed) "${it.fps} FPS（高速）" else "${it.fps} FPS" },
+        menu(fpsBtn, list.map {
+            when {
+                it.highSpeed && hsShutterPriority -> "${it.fps} FPS（快门优先）"
+                it.highSpeed || !manualOk -> "${it.fps} FPS（自动曝光）"
+                else -> "${it.fps} FPS（手动快门）"
+            }
+        },
             list.indexOfFirst { it.fps == mode()?.fps }) { i ->
             modeIdx = modes.indexOf(list[i]); reopen()
+            if (list[i].highSpeed && !hsShutterPriority)
+                toast("${list[i].fps} FPS 高速档无法锁快门；拍清杆头请选手动快门档")
         }
     }
 
     private fun pickShutter() {
+        if (mode()?.highSpeed == true && !hsShutterPriority) {
+            toast("此高速档不支持快门优先；请选手动快门档"); return
+        }
+        if (mode()?.highSpeed != true && !manualOk) { toast("此镜头不支持手动曝光"); return }
         menu(shutterText, shutters.map { "1/$it" }, shutterIdx) { i ->
-            shutterIdx = i; applySettings(); refreshButtons()
+            shutterIdx = i; actualExposureNs = 0L; actualIso = 0
+            applySettings(); refreshButtons()
         }
     }
 
     private fun pickIso() {
+        if (mode()?.highSpeed == true) { toast("此高速档强制自动曝光；请选手动快门档"); return }
+        if (!manualOk) { toast("此镜头不支持手动曝光"); return }
         menu(isoText, isoSteps.map { it.toString() }, isoSteps.indexOfFirst { it >= iso }) { i ->
-            iso = isoSteps[i]; applySettings(); refreshButtons()
+            iso = isoSteps[i]; actualExposureNs = 0L; actualIso = 0
+            applySettings(); refreshButtons()
         }
     }
 
     private fun refreshButtons() {
         val m = mode()
         resBtn.text = if (m == null) "—" else if (m.size.width >= 3000) "4K" else "${min(m.size.width, m.size.height)}p"
-        fpsBtn.text = if (m == null) "—" else if (m.highSpeed) "${m.fps} FPS 高速" else "${m.fps} FPS"
+        fpsBtn.text = when {
+            m == null -> "—"
+            m.highSpeed && hsShutterPriority -> "${m.fps} FPS 快门优先"
+            m.highSpeed || !manualOk -> "${m.fps} FPS 自动"
+            else -> "${m.fps} FPS 手动"
+        }
         stationBtn.setLabel(station, "机位")
-        shutterText.setLabel("1/${shutters[shutterIdx]}", "快门")
-        isoText.setLabel("$iso", "ISO")
+        val canSetShutter = if (m?.highSpeed == true) hsShutterPriority else manualOk
+        val canSetIso = manualOk && m?.highSpeed != true
+        shutterText.setLabel(if (canSetShutter) "1/${shutters[shutterIdx]}" else "自动", "快门")
+        isoText.setLabel(if (canSetIso) "$iso" else "自动", "ISO")
+        shutterText.alpha = if (canSetShutter) 1f else 0.45f
+        isoText.alpha = if (canSetIso) 1f else 0.45f
+        meterBtn.alpha = if (canSetIso) 1f else 0.45f
         gridBtn.dim(gridOn); ghostBtn.dim(ghostOn)
         playBtn.alpha = if (lastUri == null) 0.45f else 1f
         shutterBtnView?.recording = recording()
@@ -399,12 +432,25 @@ class CameraActivity : Activity(), SensorEventListener {
         val m = mode()
         val mbMin = bitrate() * 60f / 8f / 1e6f
         val codec = if (m?.highSpeed == true) "H.264" else if (hevcOk()) "HEVC" else "H.264"
-        val manual = if (!manualOk) "  ⚠ 此镜头不支持手动曝光"
-            else if (m?.highSpeed == true) "  ⚠ 高速档由相机自动曝光" else ""
+        val expectedNs = 1_000_000_000L / shutters[shutterIdx]
+        val canSetShutter = if (m?.highSpeed == true) hsShutterPriority else manualOk
+        val mismatch = canSetShutter && actualExposureNs > 0 &&
+            abs(actualExposureNs - expectedNs) > expectedNs / 4
+        val manual = when {
+            mismatch -> "⚠ 实际快门与设定不符"
+            m?.highSpeed == true && hsShutterPriority -> "高速快门优先 · ISO 自动"
+            m?.highSpeed == true -> "高速档自动曝光，快门不能锁定"
+            !manualOk -> "此镜头不支持手动曝光"
+            else -> "手动曝光"
+        }
+        val actual = if (actualExposureNs > 0)
+            "回报 1/%.0f%s".format(1e9 / actualExposureNs,
+                if (actualIso > 0) " ISO $actualIso" else "")
+            else "回报读取中"
         val sz = m?.let { "${it.size.height}×${it.size.width} " } ?: ""
         recTime.text = if (recording())
             "%.1fs".format((SystemClock.elapsedRealtime() - recStart) / 1000f) else ""
-        info.text = "$sz$codec ${bitrate() / 1_000_000}Mbps ≈ %.0fMB/分钟$manual\n水平 %+.1f°  俯仰 %+.1f°%s"
+        info.text = "$sz$codec ${bitrate() / 1_000_000}Mbps ≈ %.0fMB/分钟\n$manual · $actual\n水平 %+.1f°  俯仰 %+.1f°%s"
             .format(mbMin, roll, pitch, refDelta())
     }
 
@@ -458,24 +504,40 @@ class CameraActivity : Activity(), SensorEventListener {
 
     // ======================= 分辨率 × 帧率 =======================
 
-    /** 列出这颗镜头真正支持的 1080p / 4K × 30 / 60 / 120 / 240。 */
+    /** Android 16 的快门优先由 AE 控制 ISO；SDK 35 构建时通过公开的 Key 构造器读取新键。 */
+    private fun supportsShutterPriority(c: CameraCharacteristics): Boolean {
+        if (Build.VERSION.SDK_INT < 36) return false
+        return try {
+            val modes = c.get(AE_PRIORITY_AVAILABLE_KEY) ?: return false
+            AE_PRIORITY_EXPOSURE_TIME in modes &&
+                c.availableCaptureRequestKeys.any { it.name == AE_PRIORITY_REQUEST_KEY.name }
+        } catch (_: Exception) { false }
+    }
+
+    /** 普通会话优先提供手动 120fps；受限高速会话按能力提供快门优先或全自动。 */
     private fun rebuildModes() {
         val l = lens() ?: return
         val c = try { cm.getCameraCharacteristics(l.id) } catch (_: Exception) { return }
+        hsShutterPriority = supportsShutterPriority(c)
         val map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return
         val recSizes = map.getOutputSizes(MediaRecorder::class.java) ?: emptyArray()
         val hsSizes = try { map.highSpeedVideoSizes?.toList() ?: emptyList() } catch (_: Exception) { emptyList() }
+        val normalFps = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.toList() ?: emptyList()
+        val caps = c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
+        val canManual = CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR in caps
         val out = ArrayList<Mode>()
         for (want in listOf(Size(1920, 1080), Size(3840, 2160))) {
             val sz = recSizes.firstOrNull { it == want } ?: continue
             val minDur = map.getOutputMinFrameDuration(MediaRecorder::class.java, sz)
             val maxFps = if (minDur > 0) (1e9 / minDur).roundToInt() else 30
             for (f in intArrayOf(30, 60)) if (f <= maxFps + 1) out.add(Mode(sz, f, false))
+            val manual120 = canManual && maxFps >= 119 && normalFps.any { it.lower == 120 && it.upper == 120 }
+            if (manual120) out.add(Mode(sz, 120, false))
             // 高速档：这台机器的 240fps（1080p/720p）实测始终是假的（HAL 接受请求，传感器不切高速模式），
             // 已确认只有 120fps 是真实可用的，所以只提供 120，不再展示 240。
             if (hsSizes.contains(sz)) {
                 val ranges = try { map.getHighSpeedVideoFpsRangesFor(sz).toList() } catch (_: Exception) { emptyList() }
-                if (ranges.any { it.upper >= 120 } && out.none { m -> m.size == sz && m.fps == 120 }) {
+                if (!manual120 && ranges.any { it.lower == 120 && it.upper == 120 }) {
                     out.add(Mode(sz, 120, true))
                 }
             }
@@ -539,6 +601,7 @@ class CameraActivity : Activity(), SensorEventListener {
         val l = lens() ?: run { toast("没有后置摄像头"); return }
         if (device != null) return
         chars = cm.getCameraCharacteristics(l.id)
+        hsShutterPriority = supportsShutterPriority(chars!!)
         if (modes.isEmpty()) rebuildModes()
         val caps = chars!!.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
         manualOk = CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR in caps
@@ -554,8 +617,10 @@ class CameraActivity : Activity(), SensorEventListener {
 
 
     private fun closeCamera() {
+        sessionGeneration.incrementAndGet()
         try { session?.close() } catch (_: Exception) {}
         session = null
+        actualExposureNs = 0L; actualIso = 0
         device?.close(); device = null
         try { hsRecorder?.release() } catch (_: Exception) {}
         hsRecorder = null; hsWriting = false
@@ -605,9 +670,11 @@ class CameraActivity : Activity(), SensorEventListener {
             hsRecorder = null
         }
         val targets = listOfNotNull(previewSurface, if (m.highSpeed) hsRecorder?.surface else recSurface)
+        val generation = sessionGeneration.incrementAndGet()
         try { session?.close() } catch (_: Exception) {}
         val cb = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(s: CameraCaptureSession) {
+                if (generation != sessionGeneration.get()) { s.close(); return }
                 android.util.Log.i("GT", "session ok hs=${m.highSpeed} targets=${targets.size} fps=${m.fps}")
                 session = s
                 applySettings(recSurface)
@@ -620,6 +687,7 @@ class CameraActivity : Activity(), SensorEventListener {
                 }
             }
             override fun onConfigureFailed(s: CameraCaptureSession) {
+                if (generation != sessionGeneration.get()) { s.close(); return }
                 android.util.Log.e("GT", "configure failed hs=${m.highSpeed} ${m.size} ${m.fps} targets=${targets.size}")
                 ui.post {
                     if (m.highSpeed) {
@@ -627,6 +695,16 @@ class CameraActivity : Activity(), SensorEventListener {
                         val back = modes.indexOfLast { !it.highSpeed && it.size == m.size }
                         if (back >= 0) modeIdx = back
                         toast("这台机器的系统接口不支持 ${m.fps}fps 录制，已退回 ${mode()?.fps ?: 60}fps")
+                        reopen()
+                    } else if (m.fps == 120) {
+                        if (recSurface != null) {
+                            try { recorder?.release() } catch (_: Exception) {}
+                            recorder = null; activeRecSurface = null
+                            discardPendingRecording()
+                        }
+                        modeIdx = modes.indexOfLast { !it.highSpeed && it.size == m.size && it.fps == 60 }
+                            .takeIf { it >= 0 } ?: modeIdx
+                        toast("普通 120 FPS 会话未启动；已切到 ${mode()?.fps} FPS 手动快门")
                         reopen()
                     } else toast("这个规格配不上（换分辨率或帧率）")
                 }
@@ -639,9 +717,8 @@ class CameraActivity : Activity(), SensorEventListener {
                     else android.hardware.camera2.params.SessionConfiguration.SESSION_REGULAR
                 val config = android.hardware.camera2.params.SessionConfiguration(
                     type, cfgs, { r -> bg.post(r) }, cb)
-                if (m.highSpeed) {
-                    // FPS 是 session 参数，创建会话时就要带上，否则后续 repeating request 里
-                    // 再设也不会重新配置 sensor/HAL。
+                if (m.fps >= 60) {
+                    // FPS 是 session 参数，创建会话时就带上，避免预览模板先锁到 30fps。
                     val params = d.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
                     params.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(m.fps, m.fps))
                     params.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
@@ -675,7 +752,7 @@ class CameraActivity : Activity(), SensorEventListener {
         b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
         b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(m.fps, m.fps))
         if (Build.VERSION.SDK_INT >= 30) lens()?.let { if (it.zoom != 1f) b.set(CaptureRequest.CONTROL_ZOOM_RATIO, it.zoom) }
-        // 高速档只能用相机自己的自动曝光
+        // 普通会话用全手动曝光；API 36 支持时，高速会话用自动 ISO + 快门优先。
         if (manualOk && metering == 0 && !m.highSpeed) {
             val c = chars!!
             val er = c.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
@@ -687,12 +764,34 @@ class CameraActivity : Activity(), SensorEventListener {
             b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exp)
             b.set(CaptureRequest.SENSOR_SENSITIVITY, isoC)
             b.set(CaptureRequest.SENSOR_FRAME_DURATION, 1_000_000_000L / m.fps)
+        } else if (m.highSpeed && hsShutterPriority) {
+            var exp = 1_000_000_000L / shutters[shutterIdx]
+            chars?.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let {
+                exp = exp.coerceIn(it.lower, it.upper)
+            }
+            b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+            b.set(AE_PRIORITY_REQUEST_KEY, AE_PRIORITY_EXPOSURE_TIME)
+            b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exp)
         } else {
             b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
         }
+        // 高速会话的回调可能传入内部 CaptureSession，而非 onConfigured 的包装对象。
+        val generation = sessionGeneration.get()
         val cb = object : CameraCaptureSession.CaptureCallback() {
             override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
+                if (generation != sessionGeneration.get()) return
                 if (metering > 0) onMeterFrame(res)
+                val exp = res.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                val gain = res.get(CaptureResult.SENSOR_SENSITIVITY)
+                val now = SystemClock.elapsedRealtime()
+                if (exp != null || gain != null) {
+                    if (exp != null) actualExposureNs = exp
+                    if (gain != null) actualIso = gain
+                    if (now - lastExposureUiMs >= 500) {
+                        lastExposureUiMs = now
+                        ui.post { if (generation == sessionGeneration.get()) updateInfo() }
+                    }
+                }
             }
         }
         try {
@@ -701,7 +800,17 @@ class CameraActivity : Activity(), SensorEventListener {
                 android.util.Log.i("GT", "hs burst size=${list.size} recorder=${hsRecorder != null}")
                 s.setRepeatingBurst(list, cb, bg)
             } else s.setRepeatingRequest(b.build(), cb, bg)
-        } catch (e: Exception) { ui.post { toast("设置失败：${e.message}") } }
+        } catch (e: Exception) {
+            if (m.highSpeed && hsShutterPriority) {
+                android.util.Log.w("GT", "high-speed shutter priority rejected", e)
+                hsShutterPriority = false
+                ui.post {
+                    refreshButtons()
+                    toast("此高速会话拒绝快门优先；已恢复自动曝光")
+                }
+                applySettings(recSurface)
+            } else ui.post { toast("设置失败：${e.message}") }
+        }
     }
 
     // 测光：临时开自动曝光，读它给的 曝光时间×ISO，换算到当前快门下的 ISO 后锁定
@@ -721,6 +830,7 @@ class CameraActivity : Activity(), SensorEventListener {
         val snapped = isoSteps.minByOrNull { abs(Math.log(it / target)) } ?: 800
         iso = if (ir != null) snapped.coerceIn(ir.lower, ir.upper) else snapped
         ui.post {
+            actualExposureNs = 0L; actualIso = 0
             applySettings(); refreshButtons()
             toast("自动曝光 1/%.0f ISO %d → 1/%d 需要 ISO %d".format(1e9 / e, i, shutters[shutterIdx], iso))
         }
@@ -996,5 +1106,13 @@ class CameraActivity : Activity(), SensorEventListener {
         }
     }
 
-    companion object { private const val BTN_OFF = 0xCC2A2A2A.toInt() }
+    companion object {
+        private const val BTN_OFF = 0xCC2A2A2A.toInt()
+        // API 36: CameraMetadata.CONTROL_AE_PRIORITY_MODE_SENSOR_EXPOSURE_TIME_PRIORITY
+        private const val AE_PRIORITY_EXPOSURE_TIME = 2
+        private val AE_PRIORITY_AVAILABLE_KEY = CameraCharacteristics.Key(
+            "android.control.aeAvailablePriorityModes", IntArray::class.java)
+        private val AE_PRIORITY_REQUEST_KEY = CaptureRequest.Key(
+            "android.control.aePriorityMode", Int::class.javaObjectType)
+    }
 }
