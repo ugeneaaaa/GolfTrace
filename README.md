@@ -26,7 +26,6 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 - `HomeActivity.kt`：首页三入口 + 关于
 - `CameraActivity.kt`：录制页。普通档 MediaRecorder（优先 HEVC）；高速档走厂商 CamcorderProfile / 会话面，避免假 240fps；镜头按物理 ID 去重
-- `HighSpeedRecorder.kt`：高速自建编码器备选（MediaRecorder 录制面进不了高速会话时）
 - `PlayerActivity.kt`：独立回看。MediaCodec → Surface；打开优先用时长+帧率建 CFR 时间表；显示 fps（默认 3）；截图 / 连截写入 `Pictures/杆头回看`（连截：每换一帧存一张，同帧不重复）
 - `MainActivity.kt` + `Analysis.kt` + `ShaftTracker.kt` + `Decoder.kt`：分析流程与跟踪
 - `Views.kt`：轨迹叠加等自定义绘制
