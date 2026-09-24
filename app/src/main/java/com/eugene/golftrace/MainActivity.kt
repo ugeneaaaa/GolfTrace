@@ -27,6 +27,7 @@ import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import kotlin.concurrent.thread
+import kotlin.math.roundToInt
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
@@ -163,7 +164,7 @@ class MainActivity : Activity() {
         showButtons[Show.BRIGHT] = btn("叠加") { setShow(Show.BRIGHT) }
         showButtons[Show.D3] = btn("3D") { setShow(Show.D3) }
         root.addView(row(showButtons[Show.FRAME]!!, showButtons[Show.DARK]!!, showButtons[Show.BRIGHT]!!,
-            showButtons[Show.D3]!!, btn("保存图片") { save() }))
+            showButtons[Show.D3]!!, btn("保存图片") { save() }, btn("发给AI") { shareClip() }))
         setMark(Mark.HEAD); setShow(Show.FRAME)
         return root
     }
@@ -570,6 +571,51 @@ class MainActivity : Activity() {
         } catch (ex: Exception) {
             toast("保存失败：${ex.message}")
         }
+    }
+
+    /** 剪出 起杆前 0.5s → 击球后 1.0s，发给其他 App（主要是 AI）。 */
+    private fun shareClip() {
+        val c = clip ?: run { toast("先选一段挥杆"); return }
+        val u = uri ?: return
+        val inf = info ?: return
+        if (busy) return
+        val ph = phases()
+        val start = if (ph != null) c.tUs[ph.takeaway] - 500_000 else c.tUs.first()
+        val end = if (ph != null) c.tUs[ph.impact] + 1_000_000 else c.tUs.last()
+        val fps = inf.fps.roundToInt()
+        val opts = arrayOf("原速（带声音）", "慢放 4 倍（无声音）", "慢放 8 倍（无声音）")
+        android.app.AlertDialog.Builder(this).setTitle("发送挥杆片段")
+            .setItems(opts) { _, which ->
+                val slow = intArrayOf(1, 4, 8)[which]
+                busy = true; status.text = "剪片段中…"
+                thread {
+                    try {
+                        val name = "swing_${System.currentTimeMillis()}${if (slow > 1) "_slow${slow}x" else ""}.mp4"
+                        val r = ClipExport.export(this, u, start, end, inf.rotation, slow, name)
+                        val secs = (r.endUs - r.startUs) / 1e6f
+                        val sb = StringBuilder()
+                        sb.append("高尔夫挥杆片段：原视频 ${fps}fps，截取 %.2f s（${r.frames} 帧）".format(secs))
+                        if (ph == null) sb.append("，未识别挥杆阶段，为整段")
+                        else sb.append("，从起杆前约 0.5 s 到击球后 1.0 s")
+                        if (slow > 1) sb.append("；已慢放 ${slow} 倍，播放时长 %.1f s".format(secs * slow))
+                        sb.append("。\n")
+                        if (head.anchors.isNotEmpty())
+                            sb.append(Analysis.report(c, head, grip, addrFrame(), timeScale()))
+                        runOnUiThread {
+                            busy = false; status.text = "已剪好，存于 Movies/杆头轨迹/发送"
+                            val send = Intent(Intent.ACTION_SEND).apply {
+                                type = "video/mp4"
+                                putExtra(Intent.EXTRA_STREAM, r.uri)
+                                putExtra(Intent.EXTRA_TEXT, sb.toString())
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            startActivity(Intent.createChooser(send, "发送到"))
+                        }
+                    } catch (e: Exception) {
+                        runOnUiThread { busy = false; status.text = "剪片段失败：${e.message}" }
+                    }
+                }
+            }.show()
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
