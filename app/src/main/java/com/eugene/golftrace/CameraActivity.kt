@@ -353,6 +353,7 @@ class CameraActivity : Activity(), SensorEventListener {
         val list = modes.filter { it.size == sz }
         menu(fpsBtn, list.map {
             when {
+                canSetManualExposure(it) -> "${it.fps} FPS（手动快门）"
                 it.highSpeed && hsShutterPriority -> "${it.fps} FPS（快门优先）"
                 it.highSpeed || !manualOk -> "${it.fps} FPS（自动曝光）"
                 else -> "${it.fps} FPS（手动快门）"
@@ -360,13 +361,13 @@ class CameraActivity : Activity(), SensorEventListener {
         },
             list.indexOfFirst { it.fps == mode()?.fps }) { i ->
             modeIdx = modes.indexOf(list[i]); reopen()
-            if (list[i].highSpeed && !hsShutterPriority)
+            if (list[i].highSpeed && !canSetManualExposure(list[i]) && !hsShutterPriority)
                 toast("${list[i].fps} FPS 高速档无法锁快门；拍清杆头请选手动快门档")
         }
     }
 
     private fun pickShutter() {
-        if (mode()?.highSpeed == true && !hsShutterPriority) {
+        if (mode()?.highSpeed == true && !canSetManualExposure() && !hsShutterPriority) {
             toast("此高速档不支持快门优先；请选手动快门档"); return
         }
         if (mode()?.highSpeed != true && !manualOk) { toast("此镜头不支持手动曝光"); return }
@@ -377,7 +378,7 @@ class CameraActivity : Activity(), SensorEventListener {
     }
 
     private fun pickIso() {
-        if (mode()?.highSpeed == true) { toast("此高速档强制自动曝光；请选手动快门档"); return }
+        if (mode()?.highSpeed == true && !canSetManualExposure()) { toast("此高速档使用自动 ISO；请选手动快门档"); return }
         if (!manualOk) { toast("此镜头不支持手动曝光"); return }
         menu(isoText, isoSteps.map { it.toString() }, isoSteps.indexOfFirst { it >= iso }) { i ->
             iso = isoSteps[i]; actualExposureNs = 0L; actualIso = 0
@@ -390,13 +391,14 @@ class CameraActivity : Activity(), SensorEventListener {
         resBtn.text = if (m == null) "—" else if (m.size.width >= 3000) "4K" else "${min(m.size.width, m.size.height)}p"
         fpsBtn.text = when {
             m == null -> "—"
+            canSetManualExposure(m) -> "${m.fps} FPS 手动"
             m.highSpeed && hsShutterPriority -> "${m.fps} FPS 快门优先"
             m.highSpeed || !manualOk -> "${m.fps} FPS 自动"
             else -> "${m.fps} FPS 手动"
         }
         stationBtn.setLabel(station, "机位")
-        val canSetShutter = if (m?.highSpeed == true) hsShutterPriority else manualOk
-        val canSetIso = manualOk && m?.highSpeed != true
+        val canSetIso = canSetManualExposure(m)
+        val canSetShutter = canSetIso || (m?.highSpeed == true && hsShutterPriority)
         shutterText.setLabel(if (canSetShutter) "1/${shutters[shutterIdx]}" else "自动", "快门")
         isoText.setLabel(if (canSetIso) "$iso" else "自动", "ISO")
         shutterText.alpha = if (canSetShutter) 1f else 0.45f
@@ -433,11 +435,12 @@ class CameraActivity : Activity(), SensorEventListener {
         val mbMin = bitrate() * 60f / 8f / 1e6f
         val codec = if (m?.highSpeed == true) "H.264" else if (hevcOk()) "HEVC" else "H.264"
         val expectedNs = 1_000_000_000L / shutters[shutterIdx]
-        val canSetShutter = if (m?.highSpeed == true) hsShutterPriority else manualOk
+        val canSetShutter = canSetManualExposure(m) || (m?.highSpeed == true && hsShutterPriority)
         val mismatch = canSetShutter && actualExposureNs > 0 &&
             abs(actualExposureNs - expectedNs) > expectedNs / 4
         val manual = when {
             mismatch -> "⚠ 实际快门与设定不符"
+            canSetManualExposure(m) -> "手动曝光"
             m?.highSpeed == true && hsShutterPriority -> "高速快门优先 · ISO 自动"
             m?.highSpeed == true -> "高速档自动曝光，快门不能锁定"
             !manualOk -> "此镜头不支持手动曝光"
@@ -504,9 +507,29 @@ class CameraActivity : Activity(), SensorEventListener {
 
     // ======================= 分辨率 × 帧率 =======================
 
+    private fun canSetManualExposure(m: Mode? = mode()): Boolean {
+        if (!manualOk || m == null) return false
+        if (!m.highSpeed) return true
+        // PLK110 Android 16 主摄：AE priority 仅回显设定，传感器仍按自动曝光运行。
+        // 此组合的 AE OFF 已通过 120fps 编码视频 A/B 与厂商传感器曝光字段验证。
+        // 其他设备/镜头仍走自身支持的路径，不能从这台手机推广高速手动能力。
+        return Build.MODEL == "PLK110" && Build.VERSION.SDK_INT == 36 &&
+            lens()?.id == "2" && m.fps == 120
+    }
+
+    /**
+     * 本机 HAL 实测忽略 AE 快门优先：申请 1/4000（CaptureResult 回报 0.25ms）时，
+     * 厂商 org.quic.camera2.properties_sensor.SensorActualExposureTime 仍是 5ms，
+     * 1/500 与 1/4000 的成片亮度也几乎相同；所以本机不再把快门优先当可用功能，
+     * 一律走已验证的 AE OFF 手动曝光，或如实标为自动曝光。
+     */
+    private fun priorityModeIgnoredOnThisDevice() =
+        Build.MODEL == "PLK110" && Build.VERSION.SDK_INT >= 36
+
     /** Android 16 的快门优先由 AE 控制 ISO；SDK 35 构建时通过公开的 Key 构造器读取新键。 */
     private fun supportsShutterPriority(c: CameraCharacteristics): Boolean {
         if (Build.VERSION.SDK_INT < 36) return false
+        if (priorityModeIgnoredOnThisDevice()) return false
         return try {
             val modes = c.get(AE_PRIORITY_AVAILABLE_KEY) ?: return false
             AE_PRIORITY_EXPOSURE_TIME in modes &&
@@ -752,8 +775,8 @@ class CameraActivity : Activity(), SensorEventListener {
         b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
         b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(m.fps, m.fps))
         if (Build.VERSION.SDK_INT >= 30) lens()?.let { if (it.zoom != 1f) b.set(CaptureRequest.CONTROL_ZOOM_RATIO, it.zoom) }
-        // 普通会话用全手动曝光；API 36 支持时，高速会话用自动 ISO + 快门优先。
-        if (manualOk && metering == 0 && !m.highSpeed) {
+        // 优先使用经过验证的手动路径；其余高速模式按设备支持提供快门优先。
+        if (canSetManualExposure(m) && metering == 0) {
             val c = chars!!
             val er = c.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
             val ir = c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
@@ -764,7 +787,7 @@ class CameraActivity : Activity(), SensorEventListener {
             b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exp)
             b.set(CaptureRequest.SENSOR_SENSITIVITY, isoC)
             b.set(CaptureRequest.SENSOR_FRAME_DURATION, 1_000_000_000L / m.fps)
-        } else if (m.highSpeed && hsShutterPriority) {
+        } else if (m.highSpeed && hsShutterPriority && metering == 0) {
             var exp = 1_000_000_000L / shutters[shutterIdx]
             chars?.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let {
                 exp = exp.coerceIn(it.lower, it.upper)
@@ -789,6 +812,29 @@ class CameraActivity : Activity(), SensorEventListener {
                     if (gain != null) actualIso = gain
                     if (now - lastExposureUiMs >= 500) {
                         lastExposureUiMs = now
+                        if (BuildConfig.DEBUG && File(filesDir, "exposure-probe.flag").exists()) {
+                            val keys = res.keys.filter { k ->
+                                val name = k.name.lowercase()
+                                name.contains("exposure") || name.contains("sensitivity") ||
+                                    name.contains("gain") || name.contains("aepriority") ||
+                                    name.contains("aemode") || name.contains("frameduration")
+                            }
+                            android.util.Log.i("GTExposure", "fps=${m.fps} hs=${m.highSpeed} " +
+                                "recording=$hsWriting requestExp=${r.get(CaptureRequest.SENSOR_EXPOSURE_TIME)} " +
+                                "requestAE=${r.get(CaptureRequest.CONTROL_AE_MODE)} " +
+                                "requestPriority=${if (Build.VERSION.SDK_INT >= 36) r.get(AE_PRIORITY_REQUEST_KEY) else null} " +
+                                keys.joinToString { k ->
+                                    val value = res.get(k)
+                                    val text = when (value) {
+                                        is FloatArray -> value.contentToString()
+                                        is LongArray -> value.contentToString()
+                                        is IntArray -> value.contentToString()
+                                        is ByteArray -> value.take(32).joinToString("") { "%02x".format(it.toInt() and 255) }
+                                        else -> value.toString()
+                                    }
+                                    "${k.name}=$text"
+                                })
+                        }
                         ui.post { if (generation == sessionGeneration.get()) updateInfo() }
                     }
                 }
@@ -816,7 +862,7 @@ class CameraActivity : Activity(), SensorEventListener {
     // 测光：临时开自动曝光，读它给的 曝光时间×ISO，换算到当前快门下的 ISO 后锁定
     private fun meter() {
         if (!manualOk) { toast("此镜头不支持手动曝光"); return }
-        if (mode()?.highSpeed == true) { toast("高速档由相机自动曝光"); return }
+        if (!canSetManualExposure()) { toast("此档使用自动曝光"); return }
         metering = 25; applySettings(); toast("测光中…保持画面不动")
     }
 
