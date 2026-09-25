@@ -68,3 +68,6 @@ adb shell am instrument -w -e record true -e assertExposure true \
 ## 仓库
 
 `git@github.com:ugeneaaaa/GolfTrace.git`
+
+- `main`：日常版本，装到手机上的就是它
+- `investigate/*`：单独开的调查分支，真机验证通过后再并回 `main`
