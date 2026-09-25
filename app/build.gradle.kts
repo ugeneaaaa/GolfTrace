@@ -12,17 +12,13 @@ android {
         manifestPlaceholders["appLabel"] = "杆头轨迹"
         minSdk = 29
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2"
+        versionCode = 3
+        versionName = "0.2.1"
+        testInstrumentationRunner = "com.eugene.golftrace.ExposureProbe"
     }
 
     buildTypes {
-        debug {
-            // 与已安装的正式版共存，避免不同电脑的 debug 签名无法覆盖安装。
-            applicationIdSuffix = ".debug"
-            versionNameSuffix = "-debug"
-            manifestPlaceholders["appLabel"] = "杆头轨迹 Debug"
-        }
+        // 本机调试与日常使用统一 applicationId，安装时升级同一应用。
         release {
             isMinifyEnabled = false
             signingConfig = signingConfigs.getByName("debug")
